@@ -60,14 +60,6 @@ volatile bool dryAlarm = false;
 enum CarState { STOPPED, RUNNING };
 volatile CarState currentState = STOPPED;
 
-enum ControlMode { AUTO_MODE, MANUAL_MODE };
-volatile ControlMode controlMode = AUTO_MODE;
-
-enum ManualCommand { MANUAL_STOP, MANUAL_FORWARD, MANUAL_BACKWARD, MANUAL_LEFT, MANUAL_RIGHT };
-volatile ManualCommand manualCommand = MANUAL_STOP;
-volatile int manualSpeed = 140;
-volatile unsigned long manualUntil = 0;
-
 WebServer server(80);
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -235,7 +227,6 @@ const char* html_page = R"=====(
 float readUltrasonic(int trigPin, int echoPin);
 float getReliableDistance(int trigPin, int echoPin);
 void driveMotors(int speedLeft, int speedRight);
-void applyManualCommand();
 
 // ================== TASK 1: WIFI & WEB SERVER ==================
 void TaskWeb(void *pvParameters) {
@@ -250,13 +241,10 @@ void TaskWeb(void *pvParameters) {
 
   server.on("/getSensors", []() {
     bool anyAlarm = envAlarm || dryAlarm;
-    String modeText = (controlMode == MANUAL_MODE) ? "MANUAL" : "AUTO";
     String json = "{\"temp\":" + String(currentTemp) + ",\"hum\":" + String(currentHum) + 
                   ",\"pm25\":" + String(currentPM25) + ",\"smoke\":" + (hasSmoke ? "true" : "false") + 
                   ",\"r1\":" + (relay1State ? "true" : "false") + ",\"r2\":" + (relay2State ? "true" : "false") + 
-                  ",\"alarm\":" + (anyAlarm ? "true" : "false") +
-                  ",\"mode\":\"" + modeText + "\"" +
-                  ",\"carState\":\"" + String(currentState == RUNNING ? "RUNNING" : "STOPPED") + "\"" + "}";
+                  ",\"alarm\":" + (anyAlarm ? "true" : "false") + "}";
     server.send(200, "application/json", json);
   });
 
@@ -272,8 +260,8 @@ void TaskWeb(void *pvParameters) {
   });
 
   
-  server.on("/run", []() { controlMode = AUTO_MODE; currentState = RUNNING; server.send(200, "text/plain", "OK"); });
-  server.on("/stop", []() { currentState = STOPPED; manualCommand = MANUAL_STOP; server.send(200, "text/plain", "OK"); });
+  server.on("/run", []() { currentState = RUNNING; server.send(200, "text/plain", "OK"); });
+  server.on("/stop", []() { currentState = STOPPED; server.send(200, "text/plain", "OK"); });
   server.on("/scanWifi", []() { 
     int n = WiFi.scanNetworks();
     String json = "[";
@@ -435,12 +423,6 @@ void TaskControl(void *pvParameters) {
       continue;
     }
 
-    if (controlMode == MANUAL_MODE) {
-      applyManualCommand();
-      vTaskDelay(pdMS_TO_TICKS(30));
-      continue;
-    }
-
     float distL = getReliableDistance(TRIG_L, ECHO_L);
     float distC = getReliableDistance(TRIG_C, ECHO_C);
     float distR = getReliableDistance(TRIG_R, ECHO_R);
@@ -533,33 +515,6 @@ void driveMotors(int speedLeft, int speedRight) {
 
   analogWrite(ENA_L, speedLeft);
   analogWrite(ENB_R, speedRight);
-}
-
-void applyManualCommand() {
-  if (manualUntil > 0 && millis() > manualUntil) {
-    manualCommand = MANUAL_STOP;
-    manualUntil = 0;
-  }
-
-  int spd = constrain(manualSpeed, 0, MAX_SPEED);
-
-  switch (manualCommand) {
-    case MANUAL_FORWARD:
-      driveMotors(spd, spd);
-      break;
-    case MANUAL_BACKWARD:
-      driveMotors(-spd, -spd);
-      break;
-    case MANUAL_LEFT:
-      driveMotors(-spd, spd);
-      break;
-    case MANUAL_RIGHT:
-      driveMotors(spd, -spd);
-      break;
-    default:
-      driveMotors(0, 0);
-      break;
-  }
 }
 
 void sendDataToAPI() {
@@ -744,61 +699,16 @@ void fetchCommand() {
     String payload = http.getString();
     Serial.println(payload);
 
-    DynamicJsonDocument doc(512);
-    DeserializationError error = deserializeJson(doc, payload);
-    if (error) {
-      Serial.print("Lỗi parse command JSON: ");
-      Serial.println(error.f_str());
-      http.end();
-      return;
-    }
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, payload);
 
-    String cmd = "";
-    String modeStr = "";
+    String cmd = doc["command"];
 
-    if (doc.containsKey("command") && !doc["command"].isNull()) cmd = String((const char*)doc["command"]);
-    if (doc.containsKey("mode") && !doc["mode"].isNull()) modeStr = String((const char*)doc["mode"]);
-
-    cmd.toUpperCase();
-    modeStr.toUpperCase();
-
-    int requestedSpeed = manualSpeed;
-    if (doc.containsKey("speed") && !doc["speed"].isNull()) {
-      requestedSpeed = doc["speed"];
-    }
-    requestedSpeed = constrain(requestedSpeed, 0, MAX_SPEED);
-
-    int durationMs = 0;
-    if (doc.containsKey("durationMs") && !doc["durationMs"].isNull()) {
-      durationMs = doc["durationMs"];
-    }
-
-    bool isDirectional = (cmd == "FORWARD" || cmd == "BACKWARD" || cmd == "LEFT" || cmd == "RIGHT" || cmd == "STOP");
-
-    if (modeStr == "MANUAL" || isDirectional) {
-      controlMode = MANUAL_MODE;
-      currentState = RUNNING;
-      manualSpeed = requestedSpeed;
-
-      if (cmd == "FORWARD") manualCommand = MANUAL_FORWARD;
-      else if (cmd == "BACKWARD") manualCommand = MANUAL_BACKWARD;
-      else if (cmd == "LEFT") manualCommand = MANUAL_LEFT;
-      else if (cmd == "RIGHT") manualCommand = MANUAL_RIGHT;
-      else manualCommand = MANUAL_STOP;
-
-      if (durationMs > 0) manualUntil = millis() + durationMs;
-      else manualUntil = 0;
-      http.end();
-      return;
-    }
-
-    controlMode = AUTO_MODE;
-    if (cmd == "RUNNING" || cmd == "RUN" || cmd == "AUTO" || cmd == "START") {
+    if (cmd == "RUNNING") {
       currentState = RUNNING;
     }
     else if (cmd == "STOP") {
       currentState = STOPPED;
-      manualCommand = MANUAL_STOP;
     }
   }
 
@@ -809,6 +719,6 @@ void TaskAPI(void *pvParameters) {
   while (1) {
     fetchConfigFromAPI();
     fetchCommand();
-    vTaskDelay(pdMS_TO_TICKS(300));
+    vTaskDelay(pdMS_TO_TICKS(2000)); // gọi mỗi 3s
   }
 }
