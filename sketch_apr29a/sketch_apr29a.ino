@@ -56,9 +56,22 @@ volatile bool relay2State = false;
 volatile bool envAlarm = false; 
 volatile bool dryAlarm = false;
 
-// Đã loại bỏ TEST_RUN
+// Chế độ điều khiển
 enum CarState { STOPPED, RUNNING };
+enum ControlMode { AUTO_MODE, MANUAL_MODE };
+enum ManualMoveCommand { MOVE_STOP, MOVE_FORWARD, MOVE_BACKWARD, MOVE_LEFT, MOVE_RIGHT };
+
 volatile CarState currentState = STOPPED;
+volatile ControlMode controlMode = AUTO_MODE;
+volatile ManualMoveCommand manualMoveCommand = MOVE_STOP;
+volatile int manualSpeed = 120;
+volatile unsigned long manualUntilMs = 0;
+
+// Override relay thủ công
+volatile bool manualMistOverrideEnabled = false;
+volatile bool manualFilterOverrideEnabled = false;
+volatile bool manualMistState = false;
+volatile bool manualFilterState = false;
 
 WebServer server(80);
 DHT dht(DHTPIN, DHTTYPE);
@@ -228,7 +241,14 @@ float readUltrasonic(int trigPin, int echoPin);
 float getReliableDistance(int trigPin, int echoPin);
 void driveMotors(int speedLeft, int speedRight);
 
-// ================== TASK 1: WIFI & WEB SERVER ==================
+/*
+  TASK WEB SERVER
+  - Chạy web server local trên ESP32 (port 80)
+  - Trả giao diện HTML để người dùng theo dõi sensor / điều khiển cơ bản
+  - Cung cấp endpoint đọc/ghi tham số, quét wifi, kết nối wifi
+  - Task này chạy liên tục, gọi server.handleClient() theo chu kỳ ngắn
+*/
+ // ================== TASK 1: WIFI & WEB SERVER ==================
 void TaskWeb(void *pvParameters) {
   server.on("/", []() { server.send(200, "text/html", html_page); });
   
@@ -307,7 +327,13 @@ void TaskWeb(void *pvParameters) {
   }
 }
 
-// ================== TASK 2: ĐỌC PM2.5 (UART) ==================
+/*
+  TASK PM2.5 (UART)
+  - Đọc dữ liệu bụi từ cảm biến qua Serial2
+  - Đồng bộ theo header khung dữ liệu 0x42 0x4D
+  - Cập nhật currentPM25 dùng chung cho toàn hệ thống
+*/
+ // ================== TASK 2: ĐỌC PM2.5 (UART) ==================
 void TaskPM25(void *pvParameters) {
   Serial2.begin(9600, SERIAL_8N1, DUST_RX, -1);
   uint8_t buffer[32]; // Tăng buffer để an toàn đọc header
@@ -330,7 +356,14 @@ void TaskPM25(void *pvParameters) {
   }
 }
 
-// ================== TASK 3: ĐỌC MÔI TRƯỜNG & LOGIC RELAY ==================
+/*
+  TASK ENV
+  - Đọc DHT11 (nhiệt độ/độ ẩm) + cảm biến khói
+  - Tính toán điều kiện cảnh báo envAlarm / dryAlarm
+  - Điều khiển relay tự động hoặc theo chế độ manual override
+  - Gửi dữ liệu sensor lên API theo chu kỳ
+*/
+ // ================== TASK 3: ĐỌC MÔI TRƯỜNG & LOGIC RELAY ==================
 void TaskEnv(void *pvParameters) {
   dht.begin();
   pinMode(SMOKE_PIN, INPUT);
@@ -365,25 +398,29 @@ void TaskEnv(void *pvParameters) {
     bool dryAirCondition = (currentHum > 0.0 && currentHum < thresholdHum);
 
     // --- LOGIC XỬ LÝ KHÍ ĐỘC / KHÓI ---
-    if (badAirCondition) {
-      envAlarm = true;
+    envAlarm = badAirCondition;
+    if (manualMistOverrideEnabled) {
+      digitalWrite(RELAY_1, manualMistState ? LOW : HIGH);
+      relay1State = manualMistState;
+    } else if (badAirCondition) {
       vTaskDelay(pdMS_TO_TICKS(100)); 
       digitalWrite(RELAY_1, LOW); 
       relay1State = true;
     } else {
-      envAlarm = false; 
       digitalWrite(RELAY_1, HIGH);
       relay1State = false;
     }
 
     // --- LOGIC XỬ LÝ ĐỘ ẨM THẤP ---
-    if (dryAirCondition) {
-      dryAlarm = true;
+    dryAlarm = dryAirCondition;
+    if (manualFilterOverrideEnabled) {
+      digitalWrite(RELAY_2, manualFilterState ? HIGH : LOW);
+      relay2State = manualFilterState;
+    } else if (dryAirCondition) {
       vTaskDelay(pdMS_TO_TICKS(100)); 
       digitalWrite(RELAY_2, HIGH); 
       relay2State = true;
     } else {
-      dryAlarm = false;
       digitalWrite(RELAY_2, LOW);
       relay2State = false;
     }
@@ -392,7 +429,16 @@ void TaskEnv(void *pvParameters) {
   }
 }
 
-// ================== TASK 4: ĐIỀU KHIỂN XE & PID ==================
+/*
+  TASK CONTROL (TRÁI TIM CỦA XE)
+  Thứ tự ưu tiên logic:
+  1) Nếu có alarm môi trường -> dừng xe ngay
+  2) Nếu ở MANUAL_MODE -> chạy theo manualMoveCommand, KHÔNG chạy auto PID
+  3) Nếu ở AUTO_MODE:
+     - currentState == STOPPED -> dừng
+     - currentState == RUNNING -> đọc siêu âm, né vật cản + PID giữ hướng
+*/
+ // ================== TASK 4: ĐIỀU KHIỂN XE & PID ==================
 void TaskControl(void *pvParameters) {
   pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
   pinMode(TRIG_C, OUTPUT); pinMode(ECHO_C, INPUT);
@@ -417,6 +463,40 @@ void TaskControl(void *pvParameters) {
       wasAlarm = false;
     }
 
+    if (controlMode == MANUAL_MODE) {
+      // Nếu lệnh manual có thời hạn và đã hết hạn -> tự dừng
+      if (manualUntilMs > 0 && millis() > manualUntilMs) {
+        manualMoveCommand = MOVE_STOP;
+        manualUntilMs = 0;
+      }
+
+      // Giới hạn tốc độ manual trong dải an toàn PWM
+      int moveSpeed = constrain(manualSpeed, 0, MAX_SPEED);
+
+      // Ánh xạ lệnh manual thành chuyển động bánh trái/phải
+      switch (manualMoveCommand) {
+        case MOVE_FORWARD:
+          driveMotors(moveSpeed, moveSpeed);
+          break;
+        case MOVE_BACKWARD:
+          driveMotors(-moveSpeed, -moveSpeed);
+          break;
+        case MOVE_LEFT:
+          driveMotors(-moveSpeed, moveSpeed);
+          break;
+        case MOVE_RIGHT:
+          driveMotors(moveSpeed, -moveSpeed);
+          break;
+        case MOVE_STOP:
+        default:
+          driveMotors(0, 0);
+          break;
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(30));
+      continue;
+    }
+
     if (currentState == STOPPED) {
       driveMotors(0, 0);
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -428,8 +508,11 @@ void TaskControl(void *pvParameters) {
     float distR = getReliableDistance(TRIG_R, ECHO_R);
 
     if (distC < DANGER_DIST_C) {
+      // Vật cản trước mặt quá gần:
+      // 1) lùi ngắn để thoát điểm nguy hiểm
       driveMotors(-120, -120);
       vTaskDelay(pdMS_TO_TICKS(300));
+      // 2) xoay về bên thoáng hơn (so sánh trái/phải)
       if (distL > distR) driveMotors(-180, 180);
       else driveMotors(180, -180);
       vTaskDelay(pdMS_TO_TICKS(400));
@@ -437,6 +520,7 @@ void TaskControl(void *pvParameters) {
       continue;
     }
 
+    // PID bám hướng: cân bằng khoảng cách trái/phải
     float error = distL - distR;
     float P = error;
     I = constrain(I + error, -100, 100); 
@@ -444,6 +528,7 @@ void TaskControl(void *pvParameters) {
     float PID_Value = (Kp * P) + (Ki * I) + (Kd * D);
     previousError = error;
 
+    // Khi gần vật cản phía trước, giảm tốc nền để xe phản ứng mượt hơn
     int currentBaseSpeed = baseSpeed;
     if (distC < 60) currentBaseSpeed = map(distC, DANGER_DIST_C, 60, 100, baseSpeed);
     
@@ -494,6 +579,12 @@ float getReliableDistance(int trigPin, int echoPin) {
   return d1;
 }
 
+/*
+  driveMotors(speedLeft, speedRight)
+  - speed dương: quay thuận, speed âm: quay ngược
+  - Hàm tự đảo chiều chân IN1/IN2/IN3/IN4 theo dấu tốc độ
+  - PWM được ghi qua ENA_L/ENB_R
+*/
 void driveMotors(int speedLeft, int speedRight) {
   if (speedLeft >= 0) {
     digitalWrite(IN1_L, HIGH);
@@ -590,6 +681,13 @@ void setupWiFi() {
   }
 }
 
+/*
+  fetchConfigFromAPI
+  - Lấy cấu hình mới nhất từ backend: threshold, speed, Kp/Ki/Kd
+  - Chỉ cập nhật field nếu key tồn tại để tránh ghi đè giá trị sai
+  - QUAN TRỌNG: chỉ cập nhật currentState từ API khi đang AUTO_MODE
+    => tránh trường hợp đang MANUAL mà bị backend ghi đè trạng thái chạy/dừng
+*/
 // void fetchConfigFromAPI() {
 //   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -637,6 +735,10 @@ void setupWiFi() {
 //   http.end();
 // }
 
+/*
+  fetchConfigFromAPI (phiên bản đang dùng)
+  - Đây là hàm thực thi thật (được TaskAPI gọi định kỳ)
+*/
 void fetchConfigFromAPI() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -667,9 +769,11 @@ void fetchConfigFromAPI() {
       if (doc.containsKey("ki"))            Ki            = doc["ki"];
       if (doc.containsKey("kd"))            Kd            = doc["kd"];
 
-      if (doc.containsKey("carState")) {
+      // CHỈ cập nhật currentState (Auto Mode) nếu đang ở AUTO_MODE để tránh ghi đè Manual
+      if (doc.containsKey("carState") && controlMode == AUTO_MODE) {
         String state = doc["carState"];
         currentState = (state == "RUNNING") ? RUNNING : STOPPED;
+        Serial.print("Auto State Update: "); Serial.println(state);
       }
       Serial.println("Cập nhật thông số thành công!");
     } else {
@@ -682,6 +786,14 @@ void fetchConfigFromAPI() {
   http.end();
 }
 
+/*
+  fetchCommand
+  - Poll lệnh điều khiển mới nhất từ backend
+  - Chỉ đổi mode khi payload thật sự có key "mode" (tránh fallback AUTO ngoài ý muốn)
+  - Nếu MANUAL_MODE: xử lý FORWARD/BACKWARD/LEFT/RIGHT/STOP + durationMs
+  - Nếu AUTO_MODE: chỉ xử lý RUNNING/STOP cho currentState
+  - Lệnh relay (MIST/FILTER) xử lý độc lập với mode di chuyển
+*/
 void fetchCommand() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -699,16 +811,73 @@ void fetchCommand() {
     String payload = http.getString();
     Serial.println(payload);
 
-    DynamicJsonDocument doc(256);
-    deserializeJson(doc, payload);
-
-    String cmd = doc["command"];
-
-    if (cmd == "RUNNING") {
-      currentState = RUNNING;
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+      Serial.print("Lỗi parse command JSON: ");
+      Serial.println(error.f_str());
+      http.end();
+      return;
     }
-    else if (cmd == "STOP") {
-      currentState = STOPPED;
+
+    // CHỈ cập nhật nếu có key "mode" từ server, không dùng default "AUTO" để tránh fallback vô ý
+    if (doc.containsKey("mode")) {
+      String modeStr = doc["mode"];
+      modeStr.toUpperCase();
+      if (modeStr == "MANUAL") {
+        if (controlMode == AUTO_MODE) {
+          Serial.println("Switching to MANUAL_MODE");
+          previousError = 0; I = 0; // Reset PID
+          currentState = STOPPED;    // Tạm dừng auto logic
+        }
+        controlMode = MANUAL_MODE;
+      } else if (modeStr == "AUTO") {
+        if (controlMode == MANUAL_MODE) {
+          Serial.println("Switching to AUTO_MODE");
+          manualMoveCommand = MOVE_STOP;
+        }
+        controlMode = AUTO_MODE;
+      }
+    }
+
+    String cmd = doc["command"] | "";
+    cmd.toUpperCase();
+
+    if (controlMode == MANUAL_MODE) {
+      int cmdSpeed = doc["speed"] | manualSpeed;
+      int durationMs = doc["durationMs"] | 0;
+      manualSpeed = constrain(cmdSpeed, 0, MAX_SPEED);
+
+      if (durationMs > 0) manualUntilMs = millis() + (unsigned long)durationMs;
+      else if (cmd != "") manualUntilMs = 0; // Nếu có command mới mà không có duration, coi như vô hạn hoặc tới lệnh tiếp theo
+
+      if (cmd == "FORWARD") manualMoveCommand = MOVE_FORWARD;
+      else if (cmd == "BACKWARD") manualMoveCommand = MOVE_BACKWARD;
+      else if (cmd == "LEFT") manualMoveCommand = MOVE_LEFT;
+      else if (cmd == "RIGHT") manualMoveCommand = MOVE_RIGHT;
+      else if (cmd == "STOP") manualMoveCommand = MOVE_STOP;
+      // Giữ nguyên command cũ nếu cmd rỗng và chưa hết hạn duration
+    } else {
+      // Trong AUTO_MODE, command chỉ xử lý RUNNING/STOP cho state
+      if (cmd == "RUNNING") currentState = RUNNING;
+      else if (cmd == "STOP") currentState = STOPPED;
+    }
+
+    // Xử lý lệnh Relay độc lập với Mode di chuyển
+    if (cmd == "MIST_ON") {
+      manualMistOverrideEnabled = true;
+      manualMistState = true;
+    } else if (cmd == "MIST_OFF") {
+      manualMistOverrideEnabled = true;
+      manualMistState = false;
+    }
+
+    if (cmd == "FILTER_ON") {
+      manualFilterOverrideEnabled = true;
+      manualFilterState = true;
+    } else if (cmd == "FILTER_OFF") {
+      manualFilterOverrideEnabled = true;
+      manualFilterState = false;
     }
   }
 
